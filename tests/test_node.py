@@ -114,3 +114,147 @@ def test_hash_file_invalidates_on_change(tmp_path):
 
 def test_hash_file_missing_returns_none():
     assert srm._hash_file("/no/such/file.bin", {}) is None
+
+
+# ---- graph extraction: real-world ComfyUI patterns ------------------------
+def _canon(graph: dict) -> dict:
+    return srm.extract_canonical(graph, 8, 8)
+
+
+def test_prompt_through_preview_any_and_llm_switch_falls_back_to_user_text():
+    """PreviewAny(source) → ComfySwitchNode(switch linked to PrimitiveBoolean=True)
+    → on_true TextGenerate (LLM, output not in graph). Must pass through
+    PreviewAny and fall back to the on_false branch (the user's raw prompt);
+    seed linked to Seed (rgthree) must resolve; Power Lora Loader honoured."""
+    g = {
+        "53": {"class_type": "KSampler", "inputs": {
+            "seed": ["76", 0], "steps": 13, "cfg": 1.0, "sampler_name": "euler",
+            "positive": ["79", 0], "negative": ["58", 0]}},
+        "58": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["79", 0]}},
+        "60": {"class_type": "TextGenerate", "inputs": {"prompt": ["61", 0], "max_length": 512}},
+        "61": {"class_type": "StringConcatenate",
+               "inputs": {"string_a": ["62", 0], "string_b": ["63", 0], "delimiter": ""}},
+        "62": {"class_type": "PrimitiveStringMultiline",
+               "inputs": {"value": "You are an expert prompt engineer. Expand the prompt."}},
+        "63": {"class_type": "PrimitiveStringMultiline",
+               "inputs": {"value": "portrait of a man by a rooftop infinity pool"}},
+        "65": {"class_type": "ComfySwitchNode",
+               "inputs": {"switch": ["68", 0], "on_false": ["63", 0], "on_true": ["60", 0]}},
+        "68": {"class_type": "PrimitiveBoolean", "inputs": {"value": True}},
+        "76": {"class_type": "Seed (rgthree)", "inputs": {"seed": 876576531857229}},
+        "78": {"class_type": "PreviewAny", "inputs": {"source": ["65", 0]}},
+        "79": {"class_type": "CLIPTextEncode", "inputs": {"text": ["78", 0]}},
+        "83": {"class_type": "Power Lora Loader (rgthree)", "inputs": {
+            "PowerLoraLoaderHeaderWidget": {"type": "PowerLoraLoaderHeaderWidget"},
+            "lora_1": {"on": True, "lora": "krea2/bart.safetensors", "strength": 1},
+            "lora_2": {"on": False, "lora": "krea2/off.safetensors", "strength": 0.7},
+            "➕ Add Lora": ""}},
+    }
+    m = _canon(g)
+    assert m["prompt"] == "portrait of a man by a rooftop infinity pool"
+    assert m["negative"] is None
+    assert m["seed"] == 876576531857229
+    assert m["steps"] == 13 and m["cfg"] == 1.0 and m["sampler"] == "euler"
+    assert m["loras"] == [{"name": "krea2/bart.safetensors", "strength": 1.0}]
+
+
+def test_sampler_custom_advanced_helper_nodes_and_basic_guider():
+    g = {
+        "13": {"class_type": "SamplerCustomAdvanced", "inputs": {
+            "noise": ["25", 0], "guider": ["22", 0], "sampler": ["16", 0], "sigmas": ["17", 0]}},
+        "25": {"class_type": "RandomNoise", "inputs": {"noise_seed": 4242}},
+        "22": {"class_type": "BasicGuider", "inputs": {"conditioning": ["6", 0]}},
+        "16": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "dpmpp_2m"}},
+        "17": {"class_type": "BasicScheduler", "inputs": {"scheduler": "beta", "steps": 28}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": ["7", 0]}},
+        "7": {"class_type": "CR Prompt Text", "inputs": {"prompt": "a dog on a beach"}},
+    }
+    m = _canon(g)
+    assert m["prompt"] == "a dog on a beach"
+    assert m["seed"] == 4242 and m["steps"] == 28 and m["sampler"] == "dpmpp_2m"
+
+
+def test_flux_dual_encoder_and_same_node_for_negative():
+    g = {
+        "6": {"class_type": "KSampler", "inputs": {"seed": 1, "steps": 20, "cfg": 3.5,
+              "sampler_name": "euler", "positive": ["4", 0], "negative": ["4", 0]}},
+        "4": {"class_type": "CLIPTextEncodeFlux",
+              "inputs": {"clip_l": "man", "t5xxl": "man in a black polo shirt", "guidance": 3.5}},
+    }
+    m = _canon(g)
+    assert m["prompt"] == "man in a black polo shirt"
+    assert m["negative"] is None
+
+
+def test_showtext_cached_output_of_generator_and_text_concatenate():
+    g = {
+        "S": {"class_type": "SamplerCustomAdvanced", "inputs": {"guider": ["G", 0]}},
+        "G": {"class_type": "BasicGuider", "inputs": {"conditioning": ["E", 0]}},
+        "E": {"class_type": "CLIPTextEncode", "inputs": {"text": ["C", 0]}},
+        "C": {"class_type": "Text Concatenate", "inputs": {
+            "delimiter": ", ", "text_a": ["F", 2], "text_b": "cinematic"}},
+        "F": {"class_type": "Florence2Run", "inputs": {"max_new_tokens": 1024}},
+        "X": {"class_type": "ShowText|pysssss",
+              "inputs": {"text": ["F", 2], "text_0": "The image shows a woman in a suit"}},
+    }
+    assert _canon(g)["prompt"] == "The image shows a woman in a suit, cinematic"
+
+
+def test_conditioning_passthrough_slot_and_rgthree_switches():
+    g = {
+        "S": {"class_type": "SamplerCustom", "inputs": {"positive": ["C", 0], "negative": ["C", 1]}},
+        "C": {"class_type": "LTXVConditioning",
+              "inputs": {"positive": ["P", 0], "negative": ["N", 0], "frame_rate": 25}},
+        "P": {"class_type": "CLIPTextEncode", "inputs": {"text": ["A", 0]}},
+        "A": {"class_type": "Any Switch (rgthree)", "inputs": {"any_01": ["W", 0], "any_03": ["L", 0]}},
+        "W": {"class_type": "Switch any [Crystools]",
+              "inputs": {"boolean": True, "on_true": ["L", 0], "on_false": ["X", 0]}},
+        "L": {"class_type": "String", "inputs": {"String": "storm waves and lightning"}},
+        "X": {"class_type": "String", "inputs": {"String": ""}},
+        "N": {"class_type": "CLIPTextEncode", "inputs": {"text": "low quality, worst quality"}},
+    }
+    m = _canon(g)
+    assert m["prompt"] == "storm waves and lightning"
+    assert m["negative"] == "low quality, worst quality"
+
+
+def test_lora_loader_stack_rgthree_and_stacked_advanced_dict_name():
+    g = {
+        "5": {"class_type": "Lora Loader Stack (rgthree)", "inputs": {
+            "lora_01": "a.safetensors", "strength_01": 1.0,
+            "lora_02": "None", "strength_02": 1.0}},
+        "9": {"class_type": "LoraLoaderStackedAdvanced", "inputs": {
+            "lora_name": {"content": "zavy.safetensors", "type": "loras"}, "lora_weight": 0.63}},
+        "4": {"class_type": "CR LoRA Stack", "inputs": {
+            "switch_1": "On", "lora_name_1": "c.safetensors", "model_weight_1": 0.9,
+            "switch_2": "Off", "lora_name_2": "d.safetensors", "model_weight_2": 1.0}},
+    }
+    assert _canon(g)["loras"] == [
+        {"name": "a.safetensors", "strength": 1.0},
+        {"name": "zavy.safetensors", "strength": 0.63},
+        {"name": "c.safetensors", "strength": 0.9},
+    ]
+
+
+def test_ideogram4_builder_still_reconstructed():
+    g = {
+        "S": {"class_type": "KSampler", "inputs": {"positive": ["E", 0], "negative": ["Z", 0]}},
+        "Z": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["E", 0]}},
+        "E": {"class_type": "CLIPTextEncode", "inputs": {"text": ["B", 0]}},
+        "B": {"class_type": "Ideogram4PromptBuilderKJ", "inputs": {
+            "high_level_description": "A portrait of quz0", "style": "none",
+            "background": "urban bokeh", "elements_data": "[]"}},
+    }
+    m = _canon(g)
+    assert '"high_level_description": "A portrait of quz0"' in m["prompt"]
+    assert m["negative"] is None
+
+
+# ---- explicit overrides -----------------------------------------------------
+def test_explicit_prompt_inputs_override_graph_extraction():
+    meta = {"prompt": "from graph", "negative": None}
+    srm._apply_overrides(meta, prompt_text="LLM generated text", negative_text="  ")
+    assert meta["prompt"] == "LLM generated text"
+    assert meta["negative"] is None          # blank override is ignored
+    srm._apply_overrides(meta, prompt_text=None, negative_text="blurry")
+    assert meta["prompt"] == "LLM generated text" and meta["negative"] == "blurry"

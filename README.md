@@ -44,18 +44,50 @@ for the checkpoint/UNet (searched in `checkpoints` → `diffusion_models` →
 loading a new model is slower and subsequent saves are instant. Nothing is
 written next to your model files.
 
+## Run-time prompts: `prompt_text` / `negative_text` inputs
+
+The workflow graph only stores node *inputs*. When your prompt is produced
+while the workflow runs — an LLM prompt expander (`TextGenerate`, Ollama,
+Florence/Qwen captioners), a wildcard processor, a random picker — the final
+text is **not in the graph** and no parser can recover it after the fact.
+
+For those workflows connect the actual STRING to the node's optional
+**`prompt_text`** input (and `negative_text` if you have one). Whatever you
+plug in there is written verbatim to `ai_gallery_meta.prompt` and to the
+A1111 `parameters` chunk, overriding graph extraction. Leave the inputs
+unconnected for ordinary static-prompt workflows.
+
 ## What it extracts from the workflow
 
 Walks the execution graph (no keyword guessing):
 
-- **prompt** — traces `KSampler.inputs.positive` → `CLIPTextEncode.text`
-- **negative** — traces `KSampler.inputs.negative` → `CLIPTextEncode.text`
-- **sampler, steps, cfg, seed** — from `KSampler` / `SamplerCustom`
+- **prompt / negative** — traces the sampler's `positive` / `negative` link
+  (or its `guider`, incl. `BasicGuider.conditioning`) back to the text through
+  `CLIPTextEncode`, `CLIPTextEncodeFlux` (`t5xxl`/`clip_l`), string primitives
+  (`value` / `string` / `prompt`, e.g. `CR Prompt Text`, `String Literal`),
+  `PreviewAny`, boolean routers (`ComfySwitchNode`, Crystools `Switch any`,
+  rgthree `Any Switch` — switch literal or linked to a `PrimitiveBoolean`,
+  with fallback to the other branch), `Text Concatenate` /
+  `StringConcatenate` (joined with the node's delimiter), `SDXLPromptStyler`,
+  `ImpactWildcardEncode`, Qwen image-edit encoders, and conditioning
+  pass-throughs with `(positive, negative)` in and out (`LTXVConditioning`,
+  `WanImageToVideo` — the output slot picks the side).
+  LLM/VLM generator nodes are recognised as unrecoverable: if a `ShowText`
+  node displays their output its cached text is used, otherwise the router's
+  other branch (your raw prompt) is taken — or use `prompt_text` above.
+  `ConditioningZeroOut` → empty negative; a negative identical to the
+  positive (one Flux encoder wired to both) is dropped.
+- **sampler, steps, cfg, seed** — from `KSampler*` / `SamplerCustom*`, or the
+  `RandomNoise` / `BasicScheduler` / `*Guider` / `KSamplerSelect` helpers of
+  `SamplerCustomAdvanced` graphs. Values wired from primitive/seed nodes
+  (`Seed (rgthree)`, `PrimitiveFloat`, `Seed Generator`, …) are followed.
 - **model_name** — from `CheckpointLoader*` / `UNETLoader*` / `UnetLoader*`
-- **loras** — from all LoRA loaders:
+- **loras** — only enabled entries, de-duplicated, from:
   - stock `LoraLoader`, `LoraLoaderModelOnly`
   - rgthree `Power Lora Loader` (dict slots, respects `on: false`)
-  - LoRA Stack loaders (`lora_name_1`, `lora_name_2`, …)
+  - rgthree `Lora Loader Stack` (`lora_01` + `strength_01`, skips `None`)
+  - `CR LoRA Stack` and other `lora_name_N` stacks (respects `switch_N`)
+  - `LoraLoaderStackedAdvanced` (`lora_name` widget dict + `lora_weight`)
 
 ### Custom samplers & runtime prompt builders
 

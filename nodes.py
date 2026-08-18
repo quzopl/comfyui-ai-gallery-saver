@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -145,70 +146,266 @@ def _reconstruct_ideogram4(inputs: dict) -> str:
     return _ig4_dumps(caption)
 
 
-def _get_text_recursive(graph: dict, value: Any, depth: int = 0) -> str | None:
-    """If `value` is a link [src_id, out_idx], walk to a text source and read it.
+# ---- graph text tracing ---------------------------------------------------
+# Input keys that carry (or lead to) prompt text, in preference order. Both
+# literal strings and links are tried; the first key that yields text wins.
+_TEXT_KEYS = (
+    "text", "populated_text", "text_positive", "positive_prompt", "prompt",
+    "t5xxl", "clip_l", "value", "string", "wildcard_text", "source",
+    "conditioning", "positive", "negative", "text_g", "text_l",
+)
+# Cached display widgets of ShowText/showAnything-style nodes: hold the LAST
+# value the node displayed, i.e. the real output of an upstream generator.
+_CACHED_KEYS = ("text_0", "text_1", "text2", "text_2")
+# Concatenation nodes: (ordered part keys, delimiter key)
+_CONCAT_KEYS = (
+    (("text_a", "text_b", "text_c", "text_d"), "delimiter"),
+    (("string_a", "string_b"), "delimiter"),
+)
+_GENERATOR_CLASSES = ("TextGenerate", "Florence2Run", "LLM", "Ollama", "Joy",
+                      "Qwen2VL", "Qwen3VL", "Caption", "Describe", "VLM")
+_GENERATOR_INPUT_HINTS = ("max_length", "max_new_tokens", "max_tokens",
+                          "temperature", "sampling_mode")
+_MAX_TRACE_DEPTH = 24
 
-    Handles plain CLIPTextEncode `text` strings, nested conditioning, and
-    runtime prompt builders (Ideogram 4) whose text isn't a static input.
-    `ConditioningZeroOut` is treated as empty so a zeroed negative branch
-    doesn't echo the positive prompt it wraps.
-    """
-    if depth > 6:
+
+def _is_generator(ct: str, inp: dict) -> bool:
+    """Node whose text output is produced at run time (LLM/VLM) and thus not
+    stored in the graph. Tracing into its inputs would return instructions,
+    not the prompt, so it resolves to None (or a cached ShowText value)."""
+    if any(h.lower() in ct.lower() for h in _GENERATOR_CLASSES):
+        return True
+    return any(k in inp or k.split(".")[0] in inp for k in _GENERATOR_INPUT_HINTS) and (
+        "prompt" in inp or "text" in inp)
+
+
+def _cached_display(graph: dict, link: Any) -> str | None:
+    """Cached widget text of any node that consumes `link` (ShowText|pysssss
+    `text_0`, easy showAnything `text`, …)."""
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        inp = node.get("inputs") or {}
+        if not any(v == link for v in inp.values()):
+            continue
+        for key in _CACHED_KEYS + ("text",):
+            v = inp.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+    return None
+
+
+def _get_text_recursive(graph: dict, value: Any, depth: int = 0) -> str | None:
+    """Walk a link to the text that ultimately feeds a conditioning input.
+
+    Handles literal strings, CLIPTextEncode `text`, Flux dual encoders
+    (`t5xxl`/`clip_l`), string primitives (`value`/`string`/`prompt`),
+    pass-through nodes (PreviewAny `source`), boolean routers (ComfySwitchNode /
+    Crystools `switch`/`boolean` — literal or linked to a PrimitiveBoolean),
+    rgthree Any Switch (`any_NN`), Text/String Concatenate (joined with the
+    node's delimiter), ShowText-style cached widgets, the Ideogram 4 builder /
+    bbox editor, conditioning pass-throughs with (positive, negative) in and
+    out (slot picks the side), and nested conditioning. ConditioningZeroOut →
+    empty (zeroed branch). LLM/VLM generators (TextGenerate, Florence2Run…)
+    resolve to a cached ShowText value or None, so a router falls back to its
+    other branch — usually the user's raw prompt."""
+    if depth > _MAX_TRACE_DEPTH:
         return None
     if isinstance(value, str):
-        return value
-    if isinstance(value, list) and len(value) == 2:
-        node = graph.get(str(value[0]))
-        if not node:
-            return None
-        ct = node.get("class_type", "")
-        if ct == "ConditioningZeroOut":
-            return None
-        if ct == "Ideogram4PromptBuilderKJ":
-            return _reconstruct_ideogram4(node.get("inputs") or {})
-        if ct == "Ideogram4BboxEditor":
-            # The bbox editor assembles its caption in the frontend and stores
-            # it in the `caption_json` widget, so that string *is* the prompt
-            # (the node only re-applies the target size at runtime).
-            cj = (node.get("inputs") or {}).get("caption_json")
-            if isinstance(cj, str) and cj.strip() and cj.strip() != "{}":
-                return cj
-            return None
-        inputs = node.get("inputs") or {}
-        # Boolean routers (ComfySwitchNode, ImpactSwitch, etc.): follow the
-        # active branch. `switch` may be a literal bool or a link; when it's
-        # not a plain bool we can't evaluate it, so try both branches.
-        if "on_true" in inputs or "on_false" in inputs:
-            sw = inputs.get("switch")
-            order = (("on_true",) if sw is True else
-                     ("on_false",) if sw is False else
-                     ("on_true", "on_false"))
-            for b in order:
-                if b in inputs:
-                    t = _get_text_recursive(graph, inputs[b], depth + 1)
-                    if t:
-                        return t
-            return None
-        if "text" in inputs:
-            txt = inputs["text"]
-            if isinstance(txt, str):
-                return txt
-            return _get_text_recursive(graph, txt, depth + 1)
-        # Primitive string nodes (PrimitiveStringMultiline, PrimitiveString,
-        # String Literal, …) carry their text in a `value` field.
-        if "value" in inputs:
-            val = inputs["value"]
-            if isinstance(val, str):
-                return val
-            t = _get_text_recursive(graph, val, depth + 1)
-            if t:
-                return t
-        for key in ("conditioning", "positive", "negative", "text_g", "text_l"):
-            if key in inputs:
-                t = _get_text_recursive(graph, inputs[key], depth + 1)
+        return value if value.strip() else None
+    node = _resolve(graph, value)
+    if node is None:
+        return None
+    ct = node.get("class_type", "")
+    if ct == "ConditioningZeroOut":
+        return None
+    inp = node.get("inputs") or {}
+    if ct == "Ideogram4PromptBuilderKJ":
+        return _reconstruct_ideogram4(inp)
+    if ct == "Ideogram4BboxEditor":
+        # The bbox editor assembles its caption in the frontend and stores it
+        # in the `caption_json` widget, so that string *is* the prompt.
+        cj = inp.get("caption_json")
+        if isinstance(cj, str) and cj.strip() and cj.strip() != "{}":
+            return cj
+        return None
+    if _is_generator(ct, inp):
+        return _cached_display(graph, value)
+    # conditioning pass-throughs with (positive, negative) in AND out
+    # (LTXVConditioning, WanImageToVideo, …): output slot picks the side
+    if "positive" in inp and "negative" in inp:
+        side = "negative" if value[1] == 1 else "positive"
+        return _get_text_recursive(graph, inp[side], depth + 1)
+    # boolean routers: prefer the active branch (switch literal or linked
+    # PrimitiveBoolean), but fall back to the other one if it yields no text
+    if "on_true" in inp or "on_false" in inp:
+        sw = inp.get("switch", inp.get("boolean"))
+        if not isinstance(sw, bool):
+            sw_node = _resolve(graph, sw)
+            sw = (sw_node.get("inputs") or {}).get("value") if sw_node else None
+        order = ("on_false", "on_true") if sw is False else ("on_true", "on_false")
+        for b in order:
+            if b in inp:
+                t = _get_text_recursive(graph, inp[b], depth + 1)
                 if t:
                     return t
+        return None
+    # concatenation nodes: join every part that resolves
+    for part_keys, delim_key in _CONCAT_KEYS:
+        if any(k in inp for k in part_keys):
+            parts = [_get_text_recursive(graph, inp[k], depth + 1) for k in part_keys if k in inp]
+            parts = [t.strip() for t in parts if t and t.strip()]
+            if parts:
+                delim = inp.get(delim_key)
+                return (delim if isinstance(delim, str) else " ").join(parts)
+            return None
+    lower = {k.lower(): k for k in inp}
+    any_keys = sorted(k for k in lower if k.startswith("any_"))
+    for key in list(_TEXT_KEYS) + any_keys:
+        if key in lower:
+            t = _get_text_recursive(graph, inp[lower[key]], depth + 1)
+            if t:
+                return t
+    for key in _CACHED_KEYS:
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            return v
     return None
+
+
+# ---- sampler settings -------------------------------------------------------
+_SCALAR_KEYS = ("value", "seed", "noise_seed", "Number", "number", "int", "float", "String", "string")
+
+
+def _scalar(graph: dict, v: Any, depth: int = 0) -> Any:
+    """Literal value of a sampler input; follows a link into a primitive node
+    (PrimitiveFloat `value`, Seed (rgthree) `seed`, Float `Number`, …)."""
+    if not isinstance(v, list):
+        return v
+    node = _resolve(graph, v)
+    if node is None or depth > 4:
+        return None
+    inp = node.get("inputs") or {}
+    for k in _SCALAR_KEYS:
+        if k in inp:
+            return _scalar(graph, inp[k], depth + 1)
+    return None
+
+
+def _fill(out: dict, key: str, value: Any) -> None:
+    if out.get(key) is None and value is not None:
+        out[key] = value
+
+
+def _sampler_conditioning(graph: dict) -> tuple[Any, Any]:
+    """(positive, negative) link refs feeding the first sampler, following a
+    guider node for SamplerCustom* graphs (BasicGuider has one `conditioning`)."""
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        ct = node.get("class_type", "")
+        if "KSampler" in ct or "SamplerCustom" in ct:
+            inp = node.get("inputs") or {}
+            pos, neg = inp.get("positive"), inp.get("negative")
+            if pos is None and neg is None and "guider" in inp:
+                guider = _resolve(graph, inp.get("guider"))
+                if guider:
+                    gin = guider.get("inputs") or {}
+                    pos, neg = gin.get("positive"), gin.get("negative")
+                    if pos is None:
+                        pos = gin.get("conditioning")
+            return pos, neg
+    return None, None
+
+
+def _sampler_fields(graph: dict, out: dict) -> None:
+    """Sampler settings: first from sampler nodes, then from the helper nodes
+    of SamplerCustom* graphs (RandomNoise / BasicScheduler / *Guider /
+    KSamplerSelect). Linked values are followed into primitive nodes."""
+    nodes = [n for n in graph.values() if isinstance(n, dict)]
+
+    def take(node: dict) -> None:
+        inp = node.get("inputs") or {}
+        s = _scalar(graph, inp.get("sampler_name"))
+        _fill(out, "sampler", s if isinstance(s, str) and s else None)
+        _fill(out, "steps", _int_or_none(_scalar(graph, inp.get("steps"))))
+        _fill(out, "cfg", _float_or_none(_scalar(graph, inp.get("cfg"))))
+        _fill(out, "seed", _int_or_none(_scalar(graph, inp.get("seed", inp.get("noise_seed")))))
+
+    for node in nodes:
+        ct = node.get("class_type", "")
+        if "Sampler" in ct or ct.startswith("KSampler"):
+            take(node)
+    for node in nodes:
+        ct = node.get("class_type", "")
+        if ct in ("RandomNoise", "BasicScheduler") or "Scheduler" in ct or "Guider" in ct:
+            take(node)
+
+
+# ---- model / LoRA -----------------------------------------------------------
+def _model_name(graph: dict) -> str | None:
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        ct = node.get("class_type", "")
+        if ("Checkpoint" in ct or "UNetLoader" in ct or "UNETLoader" in ct
+                or "ModelLoader" in ct):
+            inp = node.get("inputs") or {}
+            for k in ("ckpt_name", "unet_name", "model_name", "model"):
+                v = inp.get(k)
+                if isinstance(v, str):
+                    return v
+    return None
+
+
+def _lora_name(v: Any) -> str | None:
+    """LoRA file name from a literal string or a {content: ...} widget dict.
+    Placeholders ('None', '') → None."""
+    if isinstance(v, dict):
+        v = v.get("content") or v.get("lora") or v.get("name")
+    if not isinstance(v, str) or not v.strip() or v.strip().lower() == "none":
+        return None
+    return v
+
+
+def _loras(graph: dict) -> list[dict]:
+    """LoRAs from every loader flavour: plain LoraLoader*, rgthree Power Lora
+    Loader (`lora_N` dicts with on/lora/strength), rgthree Lora Loader Stack
+    (`lora_NN` + `strength_NN`), CR LoRA Stack (`lora_name_N` + `switch_N` +
+    `model_weight_N`), LoraLoaderStackedAdvanced (`lora_name` dict +
+    `lora_weight`). Only enabled entries, no duplicates."""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(name: Any, strength: Any) -> None:
+        n = _lora_name(name)
+        if n and n not in seen:
+            seen.add(n)
+            out.append({"name": n, "strength": _float_or_none(strength)})
+
+    for node in graph.values():
+        if not isinstance(node, dict):
+            continue
+        ct = node.get("class_type", "")
+        if "lora" not in ct.lower():
+            continue
+        inp = node.get("inputs") or {}
+        for k, v in inp.items():                       # rgthree Power Lora Loader
+            if isinstance(v, dict) and "lora" in v and v.get("on", True):
+                add(v.get("lora"), v.get("strength"))
+        for k, v in inp.items():                       # rgthree Lora Loader Stack
+            m = re.fullmatch(r"lora_(\d+)", k)
+            if m and isinstance(v, str):
+                add(v, inp.get(f"strength_{m.group(1)}"))
+        for k, v in inp.items():                       # CR LoRA Stack & friends
+            m = re.fullmatch(r"lora_name_(\d+)", k)
+            if m and str(inp.get(f"switch_{m.group(1)}", "On")).lower() != "off":
+                add(v, inp.get(f"model_weight_{m.group(1)}", inp.get(f"lora_wt_{m.group(1)}",
+                                inp.get(f"model_str_{m.group(1)}"))))
+        if "lora_name" in inp or "name" in inp:        # single loaders
+            add(inp.get("lora_name", inp.get("name")),
+                inp.get("strength_model", inp.get("strength", inp.get("lora_weight"))))
+    return out
 
 
 def extract_canonical(graph: dict, width: int, height: int) -> dict:
@@ -230,80 +427,29 @@ def extract_canonical(graph: dict, width: int, height: int) -> dict:
     }
     if not isinstance(graph, dict):
         return out
-
-    sampler_found = False
-    for node_id, node in graph.items():
-        if not isinstance(node, dict):
-            continue
-        ct = node.get("class_type", "")
-        inputs = node.get("inputs") or {}
-
-        # sampler
-        if not sampler_found and ("KSampler" in ct or "SamplerCustom" in ct):
-            sampler_found = True
-            pos = inputs.get("positive")
-            neg = inputs.get("negative")
-            # Custom samplers (SamplerCustom/Advanced) route conditioning through a
-            # guider node instead of exposing positive/negative directly.
-            if pos is None and neg is None and "guider" in inputs:
-                guider = _resolve(graph, inputs.get("guider"))
-                if guider:
-                    gin = guider.get("inputs") or {}
-                    pos = gin.get("positive")
-                    neg = gin.get("negative")
-                    out["cfg"] = out["cfg"] or _float_or_none(gin.get("cfg"))
-            if pos is not None:
-                out["prompt"] = _get_text_recursive(graph, pos) or out["prompt"]
-            if neg is not None:
-                out["negative"] = _get_text_recursive(graph, neg) or out["negative"]
-            if isinstance(inputs.get("sampler_name"), str):
-                out["sampler"] = inputs["sampler_name"]
-            out["steps"] = out["steps"] or _int_or_none(inputs.get("steps"))
-            out["cfg"] = out["cfg"] or _float_or_none(inputs.get("cfg"))
-            seed = inputs.get("seed", inputs.get("noise_seed"))
-            out["seed"] = out["seed"] or _int_or_none(seed)
-
-        # checkpoint / unet
-        if (
-            "Checkpoint" in ct or "UNetLoader" in ct or "UNETLoader" in ct
-            or "ModelLoader" in ct
-        ):
-            for k in ("ckpt_name", "unet_name", "model_name", "model"):
-                v = inputs.get(k)
-                if isinstance(v, str) and not out["model_name"]:
-                    out["model_name"] = v
-                    break
-
-        # LoRA — stock loaders
-        if ("Lora" in ct or "LoRA" in ct) and "Stack" not in ct and "Power" not in ct:
-            name = inputs.get("lora_name") or inputs.get("name")
-            strength = _float_or_none(inputs.get("strength_model") or inputs.get("strength"))
-            if isinstance(name, str):
-                out["loras"].append({"name": name, "strength": strength})
-
-        # LoRA — rgthree Power Lora Loader (slot dicts)
-        if "Power Lora Loader" in ct or ct == "PowerLoraLoader (rgthree)":
-            for k, v in inputs.items():
-                if k.startswith("lora_") and isinstance(v, dict):
-                    if v.get("on") and isinstance(v.get("lora"), str):
-                        out["loras"].append({
-                            "name": v["lora"],
-                            "strength": _float_or_none(v.get("strength")),
-                        })
-
-        # LoRA — stack loaders (lora_name_1, lora_name_2, ...)
-        if "Lora" in ct and "Stack" in ct:
-            for i in range(1, 50):
-                name = inputs.get(f"lora_name_{i}") or inputs.get(f"lora_{i}_name")
-                if isinstance(name, str) and name and name.lower() != "none":
-                    strength = _float_or_none(
-                        inputs.get(f"strength_{i}")
-                        or inputs.get(f"lora_wt_{i}")
-                        or inputs.get(f"model_str_{i}")
-                    )
-                    out["loras"].append({"name": name, "strength": strength})
-
+    pos, neg = _sampler_conditioning(graph)
+    p = _get_text_recursive(graph, pos) if pos is not None else None
+    n = _get_text_recursive(graph, neg) if neg is not None else None
+    # Same text feeding both inputs (one Flux encoder wired to positive and
+    # negative) is not a negative prompt.
+    if p and n and p.strip() == n.strip():
+        n = None
+    out["prompt"], out["negative"] = p, n
+    _sampler_fields(graph, out)
+    out["model_name"] = _model_name(graph)
+    out["loras"] = _loras(graph)
     return out
+
+
+def _apply_overrides(meta: dict, *, prompt_text: str | None, negative_text: str | None) -> dict:
+    """Explicit `prompt_text` / `negative_text` node inputs beat graph
+    extraction — the only way to record text produced at run time (LLM
+    prompt expanders, wildcards, captioners). Blank values are ignored."""
+    if isinstance(prompt_text, str) and prompt_text.strip():
+        meta["prompt"] = prompt_text
+    if isinstance(negative_text, str) and negative_text.strip():
+        meta["negative"] = negative_text
+    return meta
 
 
 # ---------- CivitAI resource hashes (AutoV2 = first 12 hex of SHA256) --------
@@ -508,6 +654,24 @@ class SaveImageRichMetadata(io.ComfyNode):
                     tooltip="Also embed A1111-compatible 'parameters' chunk.",
                     optional=True,
                 ),
+                io.String.Input(
+                    "prompt_text",
+                    optional=True,
+                    force_input=True,
+                    tooltip=(
+                        "Optional. Connect the STRING that actually conditioned "
+                        "the image (e.g. the output of an LLM prompt expander, "
+                        "wildcard processor or switch). Overrides the prompt "
+                        "recovered from the workflow graph — use it whenever the "
+                        "prompt is generated at run time."
+                    ),
+                ),
+                io.String.Input(
+                    "negative_text",
+                    optional=True,
+                    force_input=True,
+                    tooltip="Optional. Explicit negative prompt STRING; overrides graph extraction.",
+                ),
                 _io.Autogrow.Input("images", template=autogrow_template),
             ],
             outputs=[],
@@ -522,6 +686,8 @@ class SaveImageRichMetadata(io.ComfyNode):
         embed_workflow: bool,
         embed_a1111: bool,
         images: _io.Autogrow.Type,
+        prompt_text: str | None = None,
+        negative_text: str | None = None,
     ) -> io.NodeOutput:
         # images is dict {img_0: batch_tensor, img_1: batch_tensor, ...}
         prompt = cls.hidden.prompt if cls.hidden else None
@@ -539,6 +705,7 @@ class SaveImageRichMetadata(io.ComfyNode):
                 batch, slot_prefix,
                 embed_workflow=embed_workflow, embed_a1111=embed_a1111,
                 prompt=prompt, extra_pnginfo=extra_pnginfo,
+                prompt_text=prompt_text, negative_text=negative_text,
             )
             all_results.extend(results)
             slot_idx += 1
@@ -555,6 +722,8 @@ class SaveImageRichMetadata(io.ComfyNode):
         embed_a1111: bool,
         prompt: dict | None,
         extra_pnginfo: dict | None,
+        prompt_text: str | None = None,
+        negative_text: str | None = None,
     ) -> list[dict]:
         output_dir = folder_paths.get_output_directory()
         h, w = images[0].shape[0], images[0].shape[1]
@@ -563,6 +732,7 @@ class SaveImageRichMetadata(io.ComfyNode):
         )
         # Same for every image in the batch; hash resource files once (cached).
         meta = extract_canonical(prompt or {}, w, h)
+        _apply_overrides(meta, prompt_text=prompt_text, negative_text=negative_text)
         _augment_with_hashes(meta)
 
         out: list[dict] = []
